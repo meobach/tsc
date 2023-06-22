@@ -272,14 +272,24 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.ToTensor(),
         normalize
     ]
-
+    augmentation_train =transforms.Compose( [
+            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize
+        ])
     data_root = '/data/netmit/rf-diary2/dataset/Imagenet'
     txt_train = './imagenet_inat/data/ImageNet_LT/ImageNet_LT_train.txt'
     train_dataset = ImageNetLT(
         root=data_root,
         txt=txt_train,
         type="train",
-        transform=moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+        transform=augmentation_train)
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
