@@ -422,26 +422,26 @@ def train(train_loader, model, optimizer, epoch, args, logger):
 
         # compute output
         output_1, target_1, _, _, loss_1, loss_class_1, loss_target_1 = model(im_q=images[0], im_k=images[1], im_labels=labels)
-        output_2, target_2, _, _, loss_2, loss_class_2, loss_target_2 = model(im_q=images[0], im_k=images[2], im_labels=labels)
-        output_3, target_3, _, _, loss_3, loss_class_3, loss_target_3 = model(im_q=images[0], im_k=images[3], im_labels=labels)
-        output_4, target_4, _, _, loss_4, loss_class_4, loss_target_4 = model(im_q=images[0], im_k=images[4], im_labels=labels)
-        output=(output_1+output_2+output_3+output_4)/4
-        target=(target_1+target_2+target_3+target_4)/4
-        loss=(loss_1+loss_2+loss_3+loss_4)/4
-        loss_class=(loss_class_1+loss_class_2+loss_class_3+loss_class_4)/4
-        loss_target=(loss_target_1+loss_target_2+loss_target_3+loss_target_4)/4
+        # output_2, target_2, _, _, loss_2, loss_class_2, loss_target_2 = model(im_q=images[0], im_k=images[2], im_labels=labels)
+        # output_3, target_3, _, _, loss_3, loss_class_3, loss_target_3 = model(im_q=images[0], im_k=images[3], im_labels=labels)
+        # output_4, target_4, _, _, loss_4, loss_class_4, loss_target_4 = model(im_q=images[0], im_k=images[4], im_labels=labels)
+        # output=(output_1+output_2+output_3+output_4)/4
+        # target=(target_1+target_2+target_3+target_4)/4
+        # loss=(loss_1+loss_2+loss_3+loss_4)/4
+        # loss_class=(loss_class_1+loss_class_2+loss_class_3+loss_class_4)/4
+        # loss_target=(loss_target_1+loss_target_2+loss_target_3+loss_target_4)/4
         # acc1/acc5 are (K+1)-way contrast classifier accuracy
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images[0].size(0))
-        losses_class.update(loss_class.item(), images[0].size(0))
-        losses_target.update(loss_target.item(), images[0].size(0))
+        acc1, acc5 = accuracy(output_1, target_1, topk=(1, 5))
+        losses.update(loss_1.item(), images[0].size(0))
+        losses_class.update(loss_class_1.item(), images[0].size(0))
+        losses_target.update(loss_target_1.item(), images[0].size(0))
         top1.update(acc1[0], images[0].size(0))
         top5.update(acc5[0], images[0].size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+        loss_1.backward()
         optimizer.step()
 
         # measure elapsed time
