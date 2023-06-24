@@ -434,7 +434,7 @@ class KCL(nn.Module):
         mask_pos_view_target = torch.cat([torch.zeros([mask_pos_view_target.shape[0], 1]).cuda(), mask_pos_view_target], dim=1)
 
         # apply temperature
-        logits /= self.T
+        #logits /= self.T
         log_prob = F.normalize((logits/self.T).exp(), dim=1, p=1).log()
 #         if(epoch%2==0):
         loss1 = - torch.sum((mask_pos_view_class * log_prob).sum(1) / mask_pos_view.sum(1)) / mask_pos_view.shape[0]
