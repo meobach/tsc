@@ -421,7 +421,7 @@ def train(train_loader, model, optimizer, epoch, args, logger):
             labels = labels.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        q, feat_q = model.encoder_q(images[0], True)  # queries: NxC
+        q = model.extract_q_feature(images[0])  # queries: NxC
         q = nn.functional.normalize(q, dim=1)
         output_1, target_1, _, _, loss_1, loss_class_1, loss_target_1 = model(im_q=q, im_k=images[1], im_labels=labels)
         output_2, target_2, _, _, loss_2, loss_class_2, loss_target_2 = model(im_q=q, im_k=images[2], im_labels=labels)
