@@ -1,448 +1,543 @@
+#!/usr/bin/env python
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import argparse
+import builtins
+import math
+import os
+import random
+import shutil
+import time
+import warnings
+
 import torch
 import torch.nn as nn
-import numpy as np
-from scipy.optimize import linear_sum_assignment
-import torch.nn.functional as F
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.optim
+import torch.multiprocessing as mp
+import torch.utils.data
+import torch.utils.data.distributed
+import torchvision.transforms as transforms
+import moco_models as models
+from dataset.imagenet_custom import ImageNetLT
+from moco.builder import concat_all_gather
+
+import moco.loader
+import moco.builder
+
+import tensorboard_logger as tb_logger
 
 
-class MoCo(nn.Module):
-    """
-    Build a MoCo model with: a query encoder, a key encoder, and a queue
-    https://arxiv.org/abs/1911.05722
-    """
-    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False):
-        """
-        dim: feature dimension (default: 128)
-        K: queue size; number of negative keys (default: 65536)
-        m: moco momentum of updating key encoder (default: 0.999)
-        T: softmax temperature (default: 0.07)
-        """
-        super(MoCo, self).__init__()
+model_names = sorted(name for name in models.__dict__
+    if name.islower() and not name.startswith("__")
+    and callable(models.__dict__[name]))
 
-        self.K = K
-        self.m = m
-        self.T = T
+parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+parser.add_argument('--dataset', default='imagenet', choices=['inat', 'imagenet'])
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
+                    choices=model_names,
+                    help='model architecture: ' +
+                        ' | '.join(model_names) +
+                        ' (default: resnet50)')
+parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
+                    help='number of data loading workers (default: 32)')
+parser.add_argument('--epochs', default=200, type=int, metavar='N',
+                    help='number of total epochs to run')
+parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
+parser.add_argument('-b', '--batch-size', default=256, type=int,
+                    metavar='N',
+                    help='mini-batch size (default: 256), this is the total '
+                         'batch size of all GPUs on the current node when '
+                         'using Data Parallel or Distributed Data Parallel')
+parser.add_argument('--lr', '--learning-rate', default=0.03, type=float,
+                    metavar='LR', help='initial learning rate', dest='lr')
+parser.add_argument('--schedule', default=[120, 160], nargs='*', type=int,
+                    help='learning rate schedule (when to drop lr by 10x)')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum of SGD solver')
+parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)',
+                    dest='weight_decay')
+parser.add_argument('-p', '--print-freq', default=10, type=int,
+                    metavar='N', help='print frequency (default: 10)')
+parser.add_argument('-s', '--save_freq', default=20, type=int,
+                    help='save frequency (default: 10)')
+parser.add_argument('--resume', default='', type=str, metavar='PATH',
+                    help='path to latest checkpoint (default: none)')
+parser.add_argument('--world-size', default=-1, type=int,
+                    help='number of nodes for distributed training')
+parser.add_argument('--rank', default=-1, type=int,
+                    help='node rank for distributed training')
+parser.add_argument('--dist-url', default='tcp://224.66.41.62:23456', type=str,
+                    help='url used to set up distributed training')
+parser.add_argument('--dist-backend', default='nccl', type=str,
+                    help='distributed backend')
+parser.add_argument('--seed', default=None, type=int,
+                    help='seed for initializing training. ')
+parser.add_argument('--gpu', default=None, type=int,
+                    help='GPU id to use.')
+parser.add_argument('--multiprocessing-distributed', action='store_true',
+                    help='Use multi-processing distributed training to launch '
+                         'N processes per node, which has N GPUs. This is the '
+                         'fastest way to use PyTorch for either single node or '
+                         'multi node data parallel training')
 
-        # create the encoders
-        # num_classes is the output fc dimension
-        self.encoder_q = base_encoder(num_classes=dim)
-        self.encoder_k = base_encoder(num_classes=dim)
+# moco specific configs:
+parser.add_argument('--moco-dim', default=128, type=int,
+                    help='feature dimension (default: 128)')
+parser.add_argument('--moco-k', default=65536, type=int,
+                    help='queue size; number of negative keys (default: 65536)')
+parser.add_argument('--moco-m', default=0.999, type=float,
+                    help='moco momentum of updating key encoder (default: 0.999)')
+parser.add_argument('--moco-t', default=0.07, type=float,
+                    help='softmax temperature (default: 0.07)')
 
-        if mlp:  # hack: brute-force replacement
-            dim_mlp = self.encoder_q.fc.weight.shape[1]
-            self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
-            self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
+# options for moco v2
+parser.add_argument('--mlp', action='store_true',
+                    help='use mlp head')
+parser.add_argument('--cos', action='store_true',
+                    help='use cosine lr schedule')
+parser.add_argument('--loss', type=str, default='SupCon')
+parser.add_argument('--sep_t', action='store_true', help='seperate target mask')
 
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data.copy_(param_q.data)  # initialize
-            param_k.requires_grad = False  # not update by gradient
+parser.add_argument('--name', default='baseline', type=str)
 
-        # create the queue
-        self.register_buffer("queue", torch.randn(dim, K))
-        self.queue = nn.functional.normalize(self.queue, dim=0)
+# KCL/TSC specific configs:
+parser.add_argument('--K', default=6, type=int,
+                    help='number of positives for each anchor')
+parser.add_argument('--targeted', action='store_true',
+                    help='use targeted supcon loss')
+parser.add_argument('--tr', type=int, default=1,
+                    help='target repeat')
+parser.add_argument('--tw', '--target-weight', default=1, type=float,
+                    help='weight on target')
 
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
-    @torch.no_grad()
-    def _momentum_update_key_encoder(self):
-        """
-        Momentum update of the key encoder
-        """
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+def main():
+    args = parser.parse_args()
 
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys):
-        # gather keys before updating queue
-        keys = concat_all_gather(keys)
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        cudnn.deterministic = True
+        warnings.warn('You have chosen to seed training. '
+                      'This will turn on the CUDNN deterministic setting, '
+                      'which can slow down your training considerably! '
+                      'You may see unexpected behavior when restarting '
+                      'from checkpoints.')
 
-        batch_size = keys.shape[0]
+    if args.gpu is not None:
+        warnings.warn('You have chosen a specific GPU. This will completely '
+                      'disable data parallelism.')
 
-        ptr = int(self.queue_ptr)
-        assert self.K % batch_size == 0  # for simplicity
+    if args.dist_url == "env://" and args.world_size == -1:
+        args.world_size = int(os.environ["WORLD_SIZE"])
 
-        # replace the keys at ptr (dequeue and enqueue)
-        self.queue[:, ptr:ptr + batch_size] = keys.T
-        ptr = (ptr + batch_size) % self.K  # move pointer
+    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
-        self.queue_ptr[0] = ptr
+    ngpus_per_node = torch.cuda.device_count()
+    if args.multiprocessing_distributed:
+        # Since we have ngpus_per_node processes per node, the total world_size
+        # needs to be adjusted accordingly
+        args.world_size = ngpus_per_node * args.world_size
+        # Use torch.multiprocessing.spawn to launch distributed processes: the
+        # main_worker process function
+        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+    else:
+        # Simply call main_worker function
+        main_worker(args.gpu, ngpus_per_node, args)
 
-    @torch.no_grad()
-    def _batch_shuffle_ddp(self, x):
-        """
-        Batch shuffle, for making use of BatchNorm.
-        *** Only support DistributedDataParallel (DDP) model. ***
-        """
-        # gather from all gpus
-        batch_size_this = x.shape[0]
-        x_gather = concat_all_gather(x)
-        batch_size_all = x_gather.shape[0]
 
-        num_gpus = batch_size_all // batch_size_this
+def main_worker(gpu, ngpus_per_node, args):
+    # save dir
+    args.name = '{}LT_{}_lr_{}_bsz_{}_wd_{}_mlp_{}_t_{}_{}_seed_{}_k_{}_dim_{}_tgted_{}_tr_{}_tw_{}_ep_{}_{}'.\
+        format(args.dataset, args.arch, args.lr, args.batch_size, args.weight_decay, args.mlp,
+               args.moco_t, args.moco_k, args.seed, args.K, args.moco_dim, args.targeted, args.tr, args.tw,
+               args.epochs, args.name)
+    args.save_folder = '/data/netmit/SenseFS/targeted/{}/models'.format(args.dataset)
+    args.save_folder = '{}/{}'.format(args.save_folder, args.name)
+    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                and args.rank % ngpus_per_node == 0):
+        if gpu == 0:
+            if not os.path.exists(args.save_folder):
+                print('Saving to {}'.format(args.save_folder))
+                os.makedirs(args.save_folder)
+            else:
+                print('Warning! Save folder {} existed.'.format(args.save_folder))
+        if gpu == 0:
+            train_logger = tb_logger.Logger(logdir=os.path.join(args.save_folder, "train"), flush_secs=2)
+        else:
+            train_logger = None
 
-        # random shuffle index
-        idx_shuffle = torch.randperm(batch_size_all).cuda()
+    args.gpu = gpu
+    # suppress printing if not master
+    if args.multiprocessing_distributed and args.gpu != 0:
+        def print_pass(*args):
+            pass
+        builtins.print = print_pass
 
-        # broadcast to all gpus
-        torch.distributed.broadcast(idx_shuffle, src=0)
+    if args.gpu is not None:
+        print("Use GPU: {} for training".format(args.gpu))
 
-        # index for restoring
-        idx_unshuffle = torch.argsort(idx_shuffle)
+    if args.distributed:
+        if args.dist_url == "env://" and args.rank == -1:
+            args.rank = int(os.environ["RANK"])
+        if args.multiprocessing_distributed:
+            # For multiprocessing distributed training, rank needs to be the
+            # global rank among all the processes
+            args.rank = args.rank * ngpus_per_node + gpu
+        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+                                world_size=args.world_size, rank=args.rank)
+    # create model
+    print("=> creating model '{}'".format(args.arch))
+    model = moco.builder.KCL(
+        models.__dict__[args.arch],
+        args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp, args.K, args.targeted, args.tr,
+        sep_t=args.sep_t, tw=args.tw)
 
-        # shuffled index for this gpu
-        gpu_idx = torch.distributed.get_rank()
-        idx_this = idx_shuffle.view(num_gpus, -1)[gpu_idx]
+    if args.distributed:
+        # For multiprocessing distributed, DistributedDataParallel constructor
+        # should always set the single device scope, otherwise,
+        # DistributedDataParallel will use all available devices.
+        if args.gpu is not None:
+            torch.cuda.set_device(args.gpu)
+            model.cuda(args.gpu)
+            # When using a single GPU per process and per
+            # DistributedDataParallel, we need to divide the batch size
+            # ourselves based on the total number of GPUs we have
+            args.batch_size = int(args.batch_size / ngpus_per_node)
+            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        else:
+            model.cuda()
+            # DistributedDataParallel will divide and allocate batch_size to all
+            # available GPUs if device_ids are not set
+            model = torch.nn.parallel.DistributedDataParallel(model)
+    elif args.gpu is not None:
+        torch.cuda.set_device(args.gpu)
+        model = model.cuda(args.gpu)
+        # comment out the following line for debugging
+        raise NotImplementedError("Only DistributedDataParallel is supported.")
+    else:
+        # AllGather implementation (batch shuffle, queue update, etc.) in
+        # this code only supports DistributedDataParallel.
+        raise NotImplementedError("Only DistributedDataParallel is supported.")
 
-        return x_gather[idx_this], idx_unshuffle
+    # define loss function (criterion) and optimizer
+    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
 
-    @torch.no_grad()
-    def _batch_unshuffle_ddp(self, x, idx_unshuffle):
-        """
-        Undo batch shuffle.
-        *** Only support DistributedDataParallel (DDP) model. ***
-        """
-        # gather from all gpus
-        batch_size_this = x.shape[0]
-        x_gather = concat_all_gather(x)
-        batch_size_all = x_gather.shape[0]
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            if args.gpu is None:
+                checkpoint = torch.load(args.resume)
+            else:
+                # Map model to be loaded to specified single gpu.
+                loc = 'cuda:{}'.format(args.gpu)
+                checkpoint = torch.load(args.resume, map_location=loc)
 
-        num_gpus = batch_size_all // batch_size_this
+            # rename moco pre-trained keys
+            state_dict = checkpoint['state_dict']
+            for k in list(state_dict.keys()):
+                # retain only encoder_q up to before the embedding layer
+                if k.startswith('module.optimal_target') or k.startswith('module.target_labels'):
+                    del state_dict[k]
 
-        # restored index for this gpu
-        gpu_idx = torch.distributed.get_rank()
-        idx_this = idx_unshuffle.view(num_gpus, -1)[gpu_idx]
+            # args.start_epoch = checkpoint['epoch']
+            msg = model.load_state_dict(state_dict, strict=False)
+            print(set(msg.missing_keys))
 
-        return x_gather[idx_this]
+            # optimizer.load_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
 
-    def forward(self, im_q, im_k, eval=False):
-        """
-        Input:
-            im_q: a batch of query images
-            im_k: a batch of key images
-        Output:
-            logits, targets
-        """
+    cudnn.benchmark = True
 
-        # compute query features
-        #q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
-        if eval:
-            q, feat_q = self.encoder_q(im_q, True)
-            return feat_q
+    # Data loading code
+    print("Building dataset...")
+    start_time = time.time()
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+
+    augmentation = [
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0),
+        transforms.ToTensor(),
+        normalize
+    ]
+    augmentation_train =transforms.Compose( [
+            transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize
+        ])
+    data_root = '/data/netmit/rf-diary2/dataset/Imagenet'
+    txt_train = './imagenet_inat/data/ImageNet_LT/ImageNet_LT_train.txt'
+    train_dataset = ImageNetLT(
+        root=data_root,
+        txt=txt_train,
+        type="train",
+        transform=augmentation_train)
+
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    else:
+        train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+
+    print("Building dataset takes {:.3f}s".format(time.time() - start_time))
+
+    if args.targeted:
+        # KCL pre-training
+        pretrain_epochs = args.epochs // 2
+        tsc_epochs = args.epochs - pretrain_epochs
+        model.module.targeted = False
+        
+        for epoch in range(pretrain_epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            adjust_learning_rate(optimizer, epoch, pretrain_epochs, args)
+
+            # train for one epoch
+            train(train_loader, model, optimizer, epoch, args, train_logger)
+
+            if (not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                         and args.rank % ngpus_per_node == 0)):
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                }, is_best=False, filename='{}/last.pth.tar'.format(args.save_folder))
+                if (epoch + 1) % args.save_freq == 0:
+                    save_checkpoint({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                    }, is_best=False, filename='{}/checkpoint_{:04d}.pth.tar'.format(args.save_folder, epoch))
+
+        # TSC training
+        # loss change, so re-initialize optimizer
+        model.module.targeted = True
+        optimizer = torch.optim.SGD(model.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay)
+
+        for epoch in range(tsc_epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            adjust_learning_rate(optimizer, epoch, tsc_epochs, args)
+
+            # train for one epoch
+            train(train_loader, model, optimizer, epoch + pretrain_epochs, args, train_logger)
+
+            if (not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                         and args.rank % ngpus_per_node == 0)):
+                save_checkpoint({
+                    'epoch': pretrain_epochs + epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                }, is_best=False, filename='{}/last.pth.tar'.format(args.save_folder))
+                if (epoch + 1) % args.save_freq == 0:
+                    save_checkpoint({
+                        'epoch': pretrain_epochs + epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                    }, is_best=False, filename='{}/checkpoint_{:04d}.pth.tar'.format(args.save_folder, pretrain_epochs + epoch))
+
+    else:
+        # KCL training
+        for epoch in range(args.start_epoch, args.epochs):
+            if args.distributed:
+                train_sampler.set_epoch(epoch)
+            adjust_learning_rate(optimizer, epoch, args.epochs, args)
+
+            # train for one epoch
+            train(train_loader, model, optimizer, epoch, args, train_logger)
+
+            if (not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0)):
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                }, is_best=False, filename='{}/last.pth.tar'.format(args.save_folder))
+                if (epoch+1) % args.save_freq == 0:
+                    save_checkpoint({
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': model.state_dict(),
+                        'optimizer' : optimizer.state_dict(),
+                    }, is_best=False, filename='{}/checkpoint_{:04d}.pth.tar'.format(args.save_folder, epoch))
+
+
+def train(train_loader, model, optimizer, epoch, args, logger):
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    losses_class = AverageMeter('Loss_class', ':.4e')
+    losses_target = AverageMeter('Loss_target', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Train Epoch: [{}]".format(epoch))
+
+    # switch to train mode
+    model.train()
+
+    end = time.time()
+    for i, (images, labels) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
+
+        if args.gpu is not None:
+            images[0] = images[0].cuda(args.gpu, non_blocking=True)
+            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+            images[2] = images[2].cuda(args.gpu, non_blocking=True)
+            images[3] = images[3].cuda(args.gpu, non_blocking=True)
+            images[4] = images[4].cuda(args.gpu, non_blocking=True)
+            labels = labels.cuda(args.gpu, non_blocking=True)
+
+        # compute output
+        q = model.extract_q_feature(images[0])  # queries: NxC
         q = nn.functional.normalize(q, dim=1)
+        output_1, target_1, _, _, loss_1, loss_class_1, loss_target_1 = model(im_q=q, im_k=images[1], im_labels=labels)
+        output_2, target_2, _, _, loss_2, loss_class_2, loss_target_2 = model(im_q=q, im_k=images[2], im_labels=labels)
+        output_3, target_3, _, _, loss_3, loss_class_3, loss_target_3 = model(im_q=q, im_k=images[3], im_labels=labels)
+        output_4, target_4, _, _, loss_4, loss_class_4, loss_target_4 = model(im_q=q, im_k=images[4], im_labels=labels)
+        output=(output_1+output_2+output_3+output_4)/4
+        target=(target_1+target_2+target_3+target_4)/4
+        loss=(loss_1+loss_2+loss_3+loss_4)/4
+        loss_class=(loss_class_1+loss_class_2+loss_class_3+loss_class_4)/4
+        loss_target=(loss_target_1+loss_target_2+loss_target_3+loss_target_4)/4
+        # acc1/acc5 are (K+1)-way contrast classifier accuracy
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images[0].size(0))
+        losses_class.update(loss_class.item(), images[0].size(0))
+        losses_target.update(loss_target.item(), images[0].size(0))
+        top1.update(acc1[0], images[0].size(0))
+        top5.update(acc5[0], images[0].size(0))
 
-        # compute key features
-        with torch.no_grad():  # no gradient to keys
-            self._momentum_update_key_encoder()  # update the key encoder
+        # compute gradient and do SGD step
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-            # shuffle for making use of BN
-            im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
 
-            k = self.encoder_k(im_k)  # keys: NxC
-            k = nn.functional.normalize(k, dim=1)
+        if i % args.print_freq == 0:
+            progress.display(i)
 
-            # undo shuffle
-            k = self._batch_unshuffle_ddp(k, idx_unshuffle)
-
-        # compute logits
-        # Einstein sum is more intuitive
-        # positive logits: Nx1
-        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
-        # negative logits: NxK
-        l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
-
-        # logits: Nx(1+K)
-        logits = torch.cat([l_pos, l_neg], dim=1)
-
-        # apply temperature
-        logits /= self.T
-
-        # labels: positive key indicators
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
-
-        # dequeue and enqueue
-        self._dequeue_and_enqueue(k)
-
-        return logits, labels, feat_q
+    if args.gpu == 0:
+        logger.log_value('loss', losses.avg, epoch)
+        logger.log_value('loss_class', losses_class.avg, epoch)
+        logger.log_value('loss_target', losses_target.avg, epoch)
+        logger.log_value('loss_c', losses.avg, epoch)
+        logger.log_value('top1', top1.avg, epoch)
+        logger.log_value('top5', top5.avg, epoch)
 
 
-class KCL(nn.Module):
-    """
-    Build a MoCo model with: a query encoder, a key encoder, and a queue
-    https://arxiv.org/abs/1911.05722
-    """
-    def __init__(self, base_encoder, dim=128, K=65536, m=0.999, T=0.07, mlp=False, num_positive=0, targeted=False, tr=1,
-                 sep_t=False, tw=1):
-        """
-        dim: feature dimension (default: 128)
-        K: queue size; number of negative keys (default: 65536)
-        m: moco momentum of updating key encoder (default: 0.999)
-        T: softmax temperature (default: 0.07)
-        """
-        super(KCL, self).__init__()
+def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+    torch.save(state, filename)
+    if is_best:
+        shutil.copyfile(filename, 'model_best.pth.tar')
 
-        self.K = K
-        self.m = m
-        self.T = T
-        self.num_positive = num_positive
-        self.n_cls = 1000
-        self.targeted = targeted
-        self.tr = tr
-        self.sep_t = sep_t
-        self.tw = tw
-        optimal_target = np.load('optimal_{}_{}_analytical.npy'.format(self.n_cls, dim))
-        optimal_target_order = np.arange(self.n_cls)
-        target_repeat = tr * np.ones(self.n_cls)
 
-        optimal_target = torch.Tensor(optimal_target).float()
-        target_repeat = torch.Tensor(target_repeat).long()
-        optimal_target = torch.cat(
-            [optimal_target[i:i + 1, :].repeat(target_repeat[i], 1) for i in range(len(target_repeat))], dim=0)
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, fmt=':f'):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
 
-        target_labels = torch.cat(
-            [torch.Tensor([optimal_target_order[i]]).repeat(target_repeat[i]) for i in range(len(target_repeat))],
-            dim=0).long().unsqueeze(-1)
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
 
-        self.register_buffer("optimal_target", optimal_target)
-        self.register_buffer("optimal_target_unique", optimal_target[::self.tr, :].contiguous().transpose(0, 1))
-        self.register_buffer("target_labels", target_labels)
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
 
-        # create the encoders
-        # num_classes is the output fc dimension
-        self.encoder_q = base_encoder(num_classes=dim)
-        self.encoder_k = base_encoder(num_classes=dim)
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
 
-        if mlp:  # hack: brute-force replacement
-            dim_mlp = self.encoder_q.fc.weight.shape[1]
-            self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
-            self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
 
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data.copy_(param_q.data)  # initialize
-            param_k.requires_grad = False  # not update by gradient
+class ProgressMeter(object):
+    def __init__(self, num_batches, meters, prefix=""):
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+        self.meters = meters
+        self.prefix = prefix
 
-        # create the queue
-        self.register_buffer("queue", torch.randn(dim, K))
-        self.register_buffer("queue_labels", -torch.ones(1, K).long())
-        self.register_buffer("class_centroid", torch.randn(self.n_cls, dim))
-        self.queue = nn.functional.normalize(self.queue, dim=0)
-        self.class_centroid = nn.functional.normalize(self.class_centroid, dim=1)
+    def display(self, batch):
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries += [str(meter) for meter in self.meters]
+        print(' '.join(entries))
 
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+    def _get_batch_fmtstr(self, num_batches):
+        num_digits = len(str(num_batches // 1))
+        fmt = '{:' + str(num_digits) + 'd}'
+        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
-    @torch.no_grad()
-    def _momentum_update_key_encoder(self):
-        """
-        Momentum update of the key encoder
-        """
-        for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
 
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys, labels):
-        # gather keys before updating queue
-        keys = concat_all_gather(keys)
-        labels = concat_all_gather(labels)
+def adjust_learning_rate(optimizer, epoch, total_epochs, args):
+    """Decay the learning rate based on schedule"""
+    lr = args.lr
+    if args.cos:  # cosine lr schedule
+        lr *= 0.5 * (1. + math.cos(math.pi * epoch / total_epochs))
+    else:  # stepwise lr schedule
+        for milestone in args.schedule:
+            lr *= 0.1 if epoch >= milestone else 1.
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
 
-        batch_size = keys.shape[0]
 
-        ptr = int(self.queue_ptr)
-        assert self.K % batch_size == 0  # for simplicity
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
 
-        # replace the keys at ptr (dequeue and enqueue)
-        self.queue[:, ptr:ptr + batch_size] = keys.T
-        self.queue_labels[:, ptr:ptr + batch_size] = labels.T
-        ptr = (ptr + batch_size) % self.K  # move pointer
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
 
-        self.queue_ptr[0] = ptr
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
 
-    @torch.no_grad()
-    def _batch_shuffle_ddp(self, x):
-        """
-        Batch shuffle, for making use of BatchNorm.
-        *** Only support DistributedDataParallel (DDP) model. ***
-        """
-        # gather from all gpus
-        batch_size_this = x.shape[0]
-        x_gather = concat_all_gather(x)
-        batch_size_all = x_gather.shape[0]
 
-        num_gpus = batch_size_all // batch_size_this
-
-        # random shuffle index
-        idx_shuffle = torch.randperm(batch_size_all).cuda()
-
-        # broadcast to all gpus
-        torch.distributed.broadcast(idx_shuffle, src=0)
-
-        # index for restoring
-        idx_unshuffle = torch.argsort(idx_shuffle)
-
-        # shuffled index for this gpu
-        gpu_idx = torch.distributed.get_rank()
-        idx_this = idx_shuffle.view(num_gpus, -1)[gpu_idx]
-
-        return x_gather[idx_this], idx_unshuffle
-
-    @torch.no_grad()
-    def _batch_unshuffle_ddp(self, x, idx_unshuffle):
-        """
-        Undo batch shuffle.
-        *** Only support DistributedDataParallel (DDP) model. ***
-        """
-        # gather from all gpus
-        batch_size_this = x.shape[0]
-        x_gather = concat_all_gather(x)
-        batch_size_all = x_gather.shape[0]
-
-        num_gpus = batch_size_all // batch_size_this
-
-        # restored index for this gpu
-        gpu_idx = torch.distributed.get_rank()
-        idx_this = idx_unshuffle.view(num_gpus, -1)[gpu_idx]
-
-        return x_gather[idx_this]
-
-    def forward(self, im_q, im_k, im_labels, eval=False):
-        """
-        Input:
-            im_q: a batch of query images
-            im_k: a batch of key images
-        Output:
-            logits, targets
-        """
-
-        # compute query features
-        if eval:
-            q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
-            q = nn.functional.normalize(q, dim=1)
-            return q, feat_q
-        q=im_q
-        # compute key features
-        with torch.no_grad():  # no gradient to keys
-            self._momentum_update_key_encoder()  # update the key encoder
-
-            # shuffle for making use of BN
-            im_k, idx_unshuffle = self._batch_shuffle_ddp(im_k)
-
-            k = self.encoder_k(im_k)  # keys: NxC
-            k = nn.functional.normalize(k, dim=1)
-
-            # undo shuffle
-            k = self._batch_unshuffle_ddp(k, idx_unshuffle)
-
-        # compute logits
-        # Einstein sum is more intuitive
-        # positive logits from augmentation: Nx1
-        l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
-        # negative logits: NxK
-        if self.targeted:
-            queue_negatives = self.queue.clone().detach()
-            target_negatives = self.optimal_target.transpose(0, 1)
-            l_neg = torch.einsum('nc,ck->nk', [q, torch.cat([queue_negatives, target_negatives], dim=1)])
-        else:
-            l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
-
-        # logits: Nx(1+K)
-        logits = torch.cat([l_pos, l_neg], dim=1)
-
-        # labels: positive key indicators
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
-
-        # positive logits from queue
-        im_labels = im_labels.contiguous().view(-1, 1)
-
-        if self.targeted:
-            queue_labels = self.queue_labels.clone().detach()
-            target_labels = self.target_labels.transpose(0, 1)
-
-            # compute the optimal matching that minimize moving distance between memory bank anchors and targets
-            with torch.no_grad():
-                mask = torch.eq(im_labels, torch.cat([queue_labels, torch.full_like(target_labels, -1)], dim=1)).float()
-                im_labels_all = concat_all_gather(im_labels)
-                features_all = concat_all_gather(q.detach())
-                # update memory bank class centroids
-                for one_label in torch.unique(im_labels_all):
-                    class_centroid_batch = F.normalize(torch.mean(features_all[im_labels_all[:, 0].eq(one_label), :], dim=0), dim=0)
-                    self.class_centroid[one_label] = 0.9*self.class_centroid[one_label] + 0.1*class_centroid_batch
-                    self.class_centroid[one_label] = F.normalize(self.class_centroid[one_label], dim=0)
-
-                centroid_target_dist = torch.einsum('nc,ck->nk', [self.class_centroid, self.optimal_target_unique])
-                centroid_target_dist = centroid_target_dist.detach().cpu().numpy()
-
-                row_ind, col_ind = linear_sum_assignment(-centroid_target_dist)
-
-                for one_label, one_idx in zip(row_ind, col_ind):
-                    if one_label not in im_labels:
-                        continue
-                    one_indices = torch.Tensor([i+one_idx*self.tr for i in range(self.tr)]).long()
-                    tmp = mask[im_labels[:, 0].eq(one_label), :]
-                    tmp[:, queue_labels.size(1)+one_indices] = 1
-                    mask[im_labels[:, 0].eq(one_label), :] = tmp
-
-            # separate samples and target
-            if self.sep_t:
-                mask_target = mask.clone()
-                mask_target[:, :queue_labels.size(1)] = 0
-                mask[:, queue_labels.size(1):] = 0
-        else:
-            mask = torch.eq(im_labels, self.queue_labels.clone().detach()).float()
-        mask_pos_view = torch.zeros_like(mask)
-
-        # sample num_positive from each class
-        if self.num_positive > 0:
-            for i in range(self.num_positive):
-                all_pos_idxs = mask.view(-1).nonzero().view(-1)
-                num_pos_per_anchor = mask.sum(1)
-                num_pos_cum = num_pos_per_anchor.cumsum(0).roll(1)
-                num_pos_cum[0] = 0
-                rand = torch.rand(mask.size(0), device=mask.device)
-                idxs = ((rand * num_pos_per_anchor).floor() + num_pos_cum).long()
-                idxs = idxs[num_pos_per_anchor.nonzero().view(-1)]
-                sampled_pos_idxs = all_pos_idxs[idxs.view(-1)]
-                mask_pos_view.view(-1)[sampled_pos_idxs] = 1
-                mask.view(-1)[sampled_pos_idxs] = 0
-        else:
-            mask_pos_view = mask.clone()
-
-        if self.targeted and self.sep_t:
-            mask_pos_view_class = mask_pos_view.clone()
-            mask_pos_view_target = mask_target.clone()
-            mask_pos_view += mask_target
-        else:
-            mask_pos_view_class = mask_pos_view.clone()
-            mask_pos_view_target = mask_pos_view.clone()
-            mask_pos_view_class[:, self.queue_labels.size(1):] = 0
-            mask_pos_view_target[:, :self.queue_labels.size(1)] = 0
-
-        mask_pos_view = torch.cat([torch.ones([mask_pos_view.shape[0], 1]).cuda(), mask_pos_view], dim=1)
-        mask_pos_view_class = torch.cat([torch.ones([mask_pos_view_class.shape[0], 1]).cuda(), mask_pos_view_class], dim=1)
-        mask_pos_view_target = torch.cat([torch.zeros([mask_pos_view_target.shape[0], 1]).cuda(), mask_pos_view_target], dim=1)
-
-        # apply temperature
-        logits /= self.T
-
-        log_prob = F.normalize(logits.exp(), dim=1, p=1).log()
-        loss_class = - torch.sum((mask_pos_view_class * log_prob).sum(1) / mask_pos_view.sum(1)) / mask_pos_view.shape[0]
-        loss_target = - torch.sum((mask_pos_view_target * log_prob).sum(1) / mask_pos_view.sum(1)) / mask_pos_view.shape[0]
-        loss_target = loss_target * self.tw
-        loss = loss_class + loss_target
-
-        # dequeue and enqueue
-        self._dequeue_and_enqueue(k, im_labels)
-
-        return logits, labels, q, None, loss, loss_class, loss_target
-
-# utils
-@torch.no_grad()
-def concat_all_gather(tensor):
-    """
-    Performs all_gather operation on the provided tensors.
-    *** Warning ***: torch.distributed.all_gather has no gradient.
-    """
-    tensors_gather = [torch.ones_like(tensor)
-        for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
-
-    output = torch.cat(tensors_gather, dim=0)
-    return output
+if __name__ == '__main__':
+    main()
