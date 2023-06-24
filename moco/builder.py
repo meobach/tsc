@@ -125,8 +125,9 @@ class MoCo(nn.Module):
         """
 
         # compute query features
-        q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
+        #q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
         if eval:
+            q, feat_q = self.encoder_q(im_q, True)
             return feat_q
         q = nn.functional.normalize(q, dim=1)
 
@@ -312,11 +313,11 @@ class KCL(nn.Module):
         """
 
         # compute query features
-        q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
-        q = nn.functional.normalize(q, dim=1)
         if eval:
+            q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
+            q = nn.functional.normalize(q, dim=1)
             return q, feat_q
-
+        q=im_q
         # compute key features
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_key_encoder()  # update the key encoder
@@ -430,7 +431,7 @@ class KCL(nn.Module):
         # dequeue and enqueue
         self._dequeue_and_enqueue(k, im_labels)
 
-        return logits, labels, q, feat_q, loss, loss_class, loss_target
+        return logits, labels, q, None, loss, loss_class, loss_target
 
 # utils
 @torch.no_grad()
