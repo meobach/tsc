@@ -328,15 +328,16 @@ class KCL(nn.Module):
         """
 
         # compute query features
+        q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
+        q = nn.functional.normalize(q, dim=1)
         if eval:
-            q, feat_q = self.encoder_q(im_q, True)
-            return feat_q
+            return q, feat_q
         targets=torch.reshape(im_labels,(im_labels.shape[0],))
         targets=targets.type(torch.LongTensor)
         bsz = targets.shape[0]
         #got temperature for each class
         class_temperature=self.class_temperature[targets]
-        q = nn.functional.normalize(q, dim=1)
+        
         # compute key features
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_key_encoder()  # update the key encoder
