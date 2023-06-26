@@ -125,9 +125,8 @@ class MoCo(nn.Module):
         """
 
         # compute query features
-        #q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
+        q, feat_q = self.encoder_q(im_q, True)  # queries: NxC
         if eval:
-            q, feat_q = self.encoder_q(im_q, True)
             return feat_q
         q = nn.functional.normalize(q, dim=1)
 
@@ -190,8 +189,6 @@ class KCL(nn.Module):
         self.tr = tr
         self.sep_t = sep_t
         self.tw = tw
-        self.class_temperature= nn.Parameter(torch.load("frequent_temperature_imagenet.pt"), requires_grad=True)
-        self.generate_temperature_frequent()
         optimal_target = np.load('optimal_{}_{}_analytical.npy'.format(self.n_cls, dim))
         optimal_target_order = np.arange(self.n_cls)
         target_repeat = tr * np.ones(self.n_cls)
@@ -231,10 +228,7 @@ class KCL(nn.Module):
         self.class_centroid = nn.functional.normalize(self.class_centroid, dim=1)
 
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-    # def extract_q_feature(self,img_q):
-    #     q, feat_q = self.encoder_q(img_q, True)  # queries: NxC
-    #     q = nn.functional.normalize(q, dim=1)
-    #     return q
+
     @torch.no_grad()
     def _momentum_update_key_encoder(self):
         """
@@ -307,16 +301,6 @@ class KCL(nn.Module):
         idx_this = idx_unshuffle.view(num_gpus, -1)[gpu_idx]
 
         return x_gather[idx_this]
-    
-    def generate_temperature_frequent(self):
-        #list_temperature=[]
-        max_value=torch.max(self.class_temperature)
-        min_value=torch.min(self.class_temperature)
-        with torch.no_grad():
-            max_value=torch.max(self.class_temperature)
-        #max_value=max_value.item()
-            for i in range(self.class_temperature.shape[0]):
-                self.class_temperature[i]=0.05+0.1*(self.class_temperature[i]-min_value)/max_value
 
     def forward(self, im_q, im_k, im_labels, eval=False):
         """
@@ -332,12 +316,7 @@ class KCL(nn.Module):
         q = nn.functional.normalize(q, dim=1)
         if eval:
             return q, feat_q
-        targets=torch.reshape(im_labels,(im_labels.shape[0],))
-        targets=targets.type(torch.LongTensor)
-        bsz = targets.shape[0]
-        #got temperature for each class
-        class_temperature=self.class_temperature[targets]
-        
+
         # compute key features
         with torch.no_grad():  # no gradient to keys
             self._momentum_update_key_encoder()  # update the key encoder
@@ -440,21 +419,18 @@ class KCL(nn.Module):
         mask_pos_view_target = torch.cat([torch.zeros([mask_pos_view_target.shape[0], 1]).cuda(), mask_pos_view_target], dim=1)
 
         # apply temperature
-        #logits /= self.T
+        logits /= self.T
 
-        log_prob = F.normalize((logits/self.T).exp(), dim=1, p=1).log()
+        log_prob = F.normalize(logits.exp(), dim=1, p=1).log()
         loss_class = - torch.sum((mask_pos_view_class * log_prob).sum(1) / mask_pos_view.sum(1)) / mask_pos_view.shape[0]
         loss_target = - torch.sum((mask_pos_view_target * log_prob).sum(1) / mask_pos_view.sum(1)) / mask_pos_view.shape[0]
         loss_target = loss_target * self.tw
         loss = loss_class + loss_target
-        # labels: positive key indicators
-        #labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
-        #loss2 = nn.CrossEntropyLoss().cuda()(logits/class_temperature, labels)
-        final_loss=loss #+loss2)/2
+
         # dequeue and enqueue
         self._dequeue_and_enqueue(k, im_labels)
 
-        return logits, labels, q, None, final_loss, loss_class, loss_target
+        return logits, labels, q, feat_q, loss, loss_class, loss_target
 
 # utils
 @torch.no_grad()
