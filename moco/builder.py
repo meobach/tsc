@@ -449,7 +449,7 @@ class KCL(nn.Module):
         loss = loss_class + loss_target
         # labels: positive key indicators
         #labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
-        loss2 = nn.CrossEntropyLoss().cuda()(logits/class_temperature, labels)
+        #loss2 = nn.CrossEntropyLoss().cuda()(logits/class_temperature, labels)
         final_loss=loss #+loss2)/2
         # dequeue and enqueue
         self._dequeue_and_enqueue(k, im_labels)
