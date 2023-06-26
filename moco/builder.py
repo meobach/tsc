@@ -191,7 +191,7 @@ class KCL(nn.Module):
         self.sep_t = sep_t
         self.tw = tw
         self.class_temperature= nn.Parameter(torch.load("frequent_temperature_imagenet.pt"), requires_grad=True)
-        
+        self.generate_temperature_frequent()
         optimal_target = np.load('optimal_{}_{}_analytical.npy'.format(self.n_cls, dim))
         optimal_target_order = np.arange(self.n_cls)
         target_repeat = tr * np.ones(self.n_cls)
@@ -448,7 +448,7 @@ class KCL(nn.Module):
         loss_target = loss_target * self.tw
         loss = loss_class + loss_target
         # labels: positive key indicators
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
+        #labels = torch.zeros(logits.shape[0], dtype=torch.long).cuda()
         loss2 = nn.CrossEntropyLoss().cuda()(logits/class_temperature, labels)
         final_loss=(loss+loss2)/2
         # dequeue and enqueue
