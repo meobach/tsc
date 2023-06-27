@@ -420,7 +420,7 @@ def train(train_loader,coreset_loader, model, optimizer, epoch, args, logger):
     list_v1,list_v2,list_targets=[],[],[]
     for images,targets in coreset_loader:
         image_root=torch.cat([images[0], images[1]], dim=0)
-        image_root=image_root.cuda(non_blocking=True)
+        image_root=image_root.cuda(args.gpu, non_blocking=True)
         bsz = targets.shape[0]
         with torch.no_grad():
             features = model.module.encoder_q(image_root)
@@ -433,8 +433,8 @@ def train(train_loader,coreset_loader, model, optimizer, epoch, args, logger):
     v2_tensor=torch.cat(list_v2,axis=0)
     targets_tensor=torch.cat(list_targets,axis=0)
     center_tensor_v1,center_tensor_v2=calculate_tensor_center(v1_tensor,v2_tensor,targets_tensor)
-    center_tensor_v1=center_tensor_v1.cuda()
-    center_tensor_v2=center_tensor_v2.cuda()
+    center_tensor_v1=center_tensor_v1.cuda(args.gpu, non_blocking=True)
+    center_tensor_v2=center_tensor_v2.cuda(args.gpu, non_blocking=True)
     end = time.time()
     for i, (images, labels) in enumerate(train_loader):
         # measure data loading time
@@ -465,7 +465,7 @@ def train(train_loader,coreset_loader, model, optimizer, epoch, args, logger):
         # measure accuracy and record loss
 
         image_root=torch.cat([images[0], images[1]], dim=0)
-        image_root=image_root.cuda(non_blocking=True)
+        image_root=image_root.cuda(args.gpu, non_blocking=True)
         targets=torch.reshape(targets,(targets.shape[0],))
         targets=targets.type(torch.LongTensor)
         bsz = targets.shape[0]
